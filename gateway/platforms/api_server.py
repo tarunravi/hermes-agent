@@ -52,6 +52,49 @@ def check_api_server_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+def _resolve_media_to_data_urls(text: str) -> str:
+    """Replace MEDIA:<path> image tags with inline base64 data-URL markdown.
+
+    Remote front-ends (Open WebUI, etc.) cannot access local file paths,
+    so we read the image, base64-encode it, and emit ``![screenshot](data:...)``.
+    Bare filenames (no directory) are resolved relative to
+    ``~/.hermes/browser_screenshots/``.  Non-image or missing files are
+    left unchanged.
+    """
+    import base64, re
+    from pathlib import Path
+
+    try:
+        from hermes_cli.config import get_hermes_home
+        _screenshots_dir = get_hermes_home() / "browser_screenshots"
+    except Exception:
+        _screenshots_dir = Path.home() / ".hermes" / "browser_screenshots"
+
+    _IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+    _MIME = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+        ".svg": "image/svg+xml",
+    }
+
+    def _repl(m: re.Match) -> str:
+        raw = m.group("path").strip().strip('`\'"')
+        p = Path(raw)
+        if not p.is_absolute():
+            p = _screenshots_dir / raw
+        if p.suffix.lower() not in _IMG_EXT or not p.is_file():
+            return m.group(0)
+        try:
+            b64 = base64.b64encode(p.read_bytes()).decode()
+            return f"![screenshot](data:{_MIME.get(p.suffix.lower(), 'image/png')};base64,{b64})"
+        except Exception:
+            return m.group(0)
+
+    return re.compile(
+        r"""[`"\']?MEDIA:\s*(?P=path>`[^`\n]+`|"[^"\n]+"|\'[^\n]+\'|\S+)[`"\']?"""
+    ).sub(_repl, text)
+
+
 class ResponseStore:
     """
     SQLite-backed LRU store for Responses API state.
@@ -293,6 +336,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        tool_progress_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -318,6 +362,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            tool_progress_callback=tool_progress_callback,
         )
         return agent
 
@@ -415,6 +460,13 @@ class APIServerAdapter(BasePlatformAdapter):
             def _on_delta(delta):
                 _stream_q.put(delta)
 
+            def _on_tool_progress(tool_name, preview, args=None):
+                display = preview if preview else tool_name
+                if tool_name == "_thinking":
+                    _stream_q.put(f"\n\n*{display}*")
+                else:
+                    _stream_q.put(f"\n\n\U0001f527 **{tool_name}**: {display}")
+
             # Start agent in background
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -422,6 +474,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                tool_progress_callback=_on_tool_progress,
             ))
 
             return await self._write_sse_chat_completion(
@@ -446,6 +499,7 @@ class APIServerAdapter(BasePlatformAdapter):
         final_response = result.get("final_response", "")
         if not final_response:
             final_response = result.get("error", "(No response generated)")
+        final_response = _resolve_media_to_data_urls(final_response)
 
         response_data = {
             "id": completion_id,
@@ -492,33 +546,34 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
 
-        # Stream content chunks as they arrive from the agent
+        # Stream content chunks.  None sentinels mark segment boundaries
+        # (text <-> tool calls) — skip them so tool progress and post-tool
+        # content still reach the client.
         loop = asyncio.get_event_loop()
-        while True:
+        while not agent_task.done():
             try:
                 delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
             except _q.Empty:
-                if agent_task.done():
-                    # Drain any remaining items
-                    while True:
-                        try:
-                            delta = stream_q.get_nowait()
-                            if delta is None:
-                                break
-                            content_chunk = {
-                                "id": completion_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                            }
-                            await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
-                        except _q.Empty:
-                            break
-                    break
                 continue
+            if delta is None:
+                continue
+            delta = _resolve_media_to_data_urls(delta)
+            content_chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            }
+            await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
 
-            if delta is None:  # End of stream sentinel
+        # Drain remaining items after agent finishes
+        while True:
+            try:
+                delta = stream_q.get_nowait()
+            except _q.Empty:
                 break
-
+            if delta is None:
+                continue
+            delta = _resolve_media_to_data_urls(delta)
             content_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
@@ -1051,6 +1106,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        tool_progress_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1065,6 +1121,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                tool_progress_callback=tool_progress_callback,
             )
             result = agent.run_conversation(
                 user_message=user_message,

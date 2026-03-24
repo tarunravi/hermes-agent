@@ -1517,7 +1517,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Include annotation data if annotated screenshot was taken
         if annotate and result.get("data", {}).get("annotations"):
             response_data["annotations"] = result["data"]["annotations"]
-        return json.dumps(response_data, ensure_ascii=False)
+        return f"{json.dumps(response_data, ensure_ascii=False)}\nMEDIA:{screenshot_path}"
     
     except Exception as e:
         # Keep the screenshot if it was captured successfully — the failure is
